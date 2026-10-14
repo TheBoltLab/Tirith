@@ -1,5 +1,5 @@
 # Safe GitHub Actions cleanup: NEVER deletes source, tags, GitHub Releases, or reference APK releases.
-# Keeps recent Gradle caches and current build artifacts.  The GitHub storage quota can lag by 6–12 h.
+# Keeps current Gradle cache families and reference builds; removes superseded caches. Quota may lag 6–12 h.
 name: Cleanup Actions Storage
 on:
   workflow_dispatch:
@@ -40,11 +40,20 @@ jobs:
           with open("/tmp/barry-caches.tsv") as f:
               records = [r for r in csv.reader(f, delimiter='\t') if len(r) >= 4]
           records.sort(key=lambda r: stamp(r[2]), reverse=True)
+          # Cache keys contain per-run hashes. Older entries in each Gradle family
+          # are superseded by recent entries even if accessed this week.
+          import re
+          family_counts = {}
           deleted = freed = 0
           for index, r in enumerate(records):
               cache_id, size, accessed, key = r[:4]
-              # Always preserve the 3 newest and all caches used in the last week.
-              if index < 3 or stamp(accessed) >= now - timedelta(days=7):
+              match = re.match(r'^(gradle-(?:transforms|dependencies|kotlin-dsl|groovy-dsl|instrumented-jars|generated-gradle-jars|home)-v\d+)', key)
+              family = match.group(1) if match else key
+              keep_count = 2 if ('transforms' in family or 'dependencies' in family) else 1
+              seen = family_counts.get(family, 0)
+              # Keep the newest three and at most 1-2 active caches per family (14-day limit).
+              if index < 3 or (seen < keep_count and stamp(accessed) >= now - timedelta(days=14)):
+                  family_counts[family] = seen + 1
                   continue
               subprocess.run(["gh", "api", "-X", "DELETE", f"repos/{repo}/actions/caches/{cache_id}"], check=True)
               deleted += 1
