@@ -1,5 +1,6 @@
+# Safe GitHub Actions cleanup: NEVER deletes source, tags, GitHub Releases, or reference APK releases.
+# Keeps recent Gradle caches and current build artifacts.  The GitHub storage quota can lag by 6–12 h.
 name: Cleanup Actions Storage
-
 on:
   workflow_dispatch:
   schedule:
@@ -19,42 +20,78 @@ concurrency:
 jobs:
   cleanup:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
-      - name: Delete repository Actions caches
+      - name: Preserve recent caches and prune abandoned ones
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
         run: |
-          echo "Current Actions caches for $REPO:"
-          gh cache list --repo "$REPO" --limit 100 || true
-
-          echo "Deleting all Actions caches for $REPO..."
-          gh cache delete --repo "$REPO" --all --succeed-on-no-caches
-
-          echo "Remaining Actions caches for $REPO:"
-          gh cache list --repo "$REPO" --limit 100 || true
-
-      - name: Delete workflow artifacts
+          gh api --paginate "repos/$REPO/actions/caches?per_page=100" \
+            --jq '.actions_caches[] | [.id, .size_in_bytes, (.last_accessed_at // .created_at), .key] | @tsv' > /tmp/barry-caches.tsv
+          python3 - <<'PY'
+          import csv, os, subprocess
+          from datetime import datetime, timezone, timedelta
+          repo = os.environ["REPO"]
+          now = datetime.now(timezone.utc)
+          def stamp(v):
+              try: return datetime.fromisoformat(v.replace('Z', '+00:00'))
+              except Exception: return now
+          with open("/tmp/barry-caches.tsv") as f:
+              records = [r for r in csv.reader(f, delimiter='\t') if len(r) >= 4]
+          records.sort(key=lambda r: stamp(r[2]), reverse=True)
+          deleted = freed = 0
+          for index, r in enumerate(records):
+              cache_id, size, accessed, key = r[:4]
+              # Always preserve the 3 newest and all caches used in the last week.
+              if index < 3 or stamp(accessed) >= now - timedelta(days=7):
+                  continue
+              subprocess.run(["gh", "api", "-X", "DELETE", f"repos/{repo}/actions/caches/{cache_id}"], check=True)
+              deleted += 1
+              freed += int(size)
+          print(f"GitHub Actions caches: found={len(records)}, removed={deleted}, freed={freed/1048576:.1f} MiB, recent caches retained")
+          PY
+      - name: Remove old disposable artifacts but keep reference builds
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
         run: |
-          echo "Deleting GitHub Actions artifacts for $REPO..."
-          gh api --paginate "repos/$REPO/actions/artifacts?per_page=100" --jq '.artifacts[].id' |
-          while read -r artifact_id; do
-            [ -z "$artifact_id" ] && continue
-            echo "Deleting artifact $artifact_id"
-            gh api -X DELETE "repos/$REPO/actions/artifacts/$artifact_id"
-          done
-
-          echo "Remaining artifact count:"
-          gh api "repos/$REPO/actions/artifacts?per_page=1" --jq '.total_count'
-
-      - name: Confirm preserved release assets
+          gh api --paginate "repos/$REPO/actions/artifacts?per_page=100" \
+            --jq '.artifacts[] | [.id, .name, .size_in_bytes, .created_at] | @tsv' > /tmp/barry-artifacts.tsv
+          python3 - <<'PY'
+          import csv, os, re, subprocess
+          from datetime import datetime, timezone, timedelta
+          repo = os.environ["REPO"]
+          now = datetime.now(timezone.utc)
+          def stamp(v):
+              try: return datetime.fromisoformat(v.replace('Z', '+00:00'))
+              except Exception: return now
+          with open("/tmp/barry-artifacts.tsv") as f:
+              records = [r for r in csv.reader(f, delimiter='\t') if len(r) >= 4]
+          records.sort(key=lambda r: stamp(r[3]), reverse=True)
+          retained_families = set()
+          deleted = freed = 0
+          for index, r in enumerate(records):
+              ident, name, size, created = r[:4]
+              family = re.sub(r'[-_]?v?\d+(?:\.\d+){1,3}.*$', '', name, flags=re.I).lower()
+              family = family or name.lower()
+              # Always keep 3 latest artifacts, anything from the last 48h,
+              # and one recent build per artifact family; releases are never touched.
+              retain = (index < 3 or stamp(created) >= now - timedelta(hours=48)
+                        or family not in retained_families
+                        or any(x in name.lower() for x in ('keystore', 'backup', 'stable-reference')))
+              if retain:
+                  retained_families.add(family)
+                  continue
+              subprocess.run(["gh", "api", "-X", "DELETE", f"repos/{repo}/actions/artifacts/{ident}"], check=True)
+              deleted += 1
+              freed += int(size)
+          print(f"Temporary artifacts: found={len(records)}, removed={deleted}, freed={freed/1048576:.1f} MiB; recent/reference builds retained")
+          PY
+      - name: Confirm GitHub Releases and APKs were not touched
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
         run: |
-          echo "Release assets are NOT deleted by this workflow."
           gh release list --repo "$REPO" --limit 10 || true
+          echo "No code, tags, release assets, or Gradle source files were deleted."
