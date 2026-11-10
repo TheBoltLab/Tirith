@@ -1,0 +1,78 @@
+name: Pixel Perfect - visual comparison (manual)
+on:
+  workflow_dispatch:
+    inputs:
+      max_changed_ratio:
+        description: 'Maximum fraction of pixels differing by > 16/255 per channel (0..1)'
+        required: true
+        default: '0.02'
+permissions:
+  contents: read
+jobs:
+  compare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python -m pip install --disable-pip-version-check pillow==11.3.0
+      - name: Compare approved baselines against real Android screenshots
+        env:
+          MAX_CHANGED_RATIO: ${{ inputs.max_changed_ratio }}
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          from PIL import Image, ImageChops
+          import os, sys
+          baseline = Path("visual-tests/baselines")
+          actual = Path("visual-tests/actual")
+          output = Path("visual-tests/results")
+          output.mkdir(parents=True, exist_ok=True)
+          threshold = float(os.environ["MAX_CHANGED_RATIO"])
+          if not 0 <= threshold <= 1:
+              sys.exit("FAIL: max_changed_ratio must be between 0 and 1")
+          files = sorted(p for p in baseline.rglob("*.png") if p.is_file())
+          if not files:
+              sys.exit("NOT VERIFIED: no approved PNG baselines in visual-tests/baselines. Upload approved reference images and REAL Android screenshots first.")
+          failures = []
+          report = []
+          for src in files:
+              rel = src.relative_to(baseline)
+              target = actual / rel
+              if not target.exists():
+                  failures.append(f"{rel}: missing REAL Android screenshot")
+                  continue
+              with Image.open(src) as base_img, Image.open(target) as actual_img:
+                  base, got = base_img.convert("RGB"), actual_img.convert("RGB")
+                  if base.size != got.size:
+                      failures.append(f"{rel}: dimensions differ: {base.size} vs {got.size}")
+                      continue
+                  diff = ImageChops.difference(base, got)
+                  mask = diff.convert("L").point(lambda v: 255 if v > 16 else 0)
+                  histogram = mask.histogram()
+                  ratio = histogram[255] / (base.width * base.height)
+                  dest = output / rel
+                  dest.parent.mkdir(parents=True, exist_ok=True)
+                  diff.save(dest)
+                  report.append(f"{rel}: changed-pixel ratio {ratio:.4%}, maximum {threshold:.4%}")
+                  if ratio > threshold:
+                      failures.append(f"{rel}: visual difference exceeds limit")
+          missing_baselines = sorted(str(p.relative_to(actual)) for p in actual.rglob("*.png") if not (baseline / p.relative_to(actual)).exists()) if actual.exists() else []
+          if missing_baselines:
+              failures.extend(f"{p}: screenshot without approved baseline" for p in missing_baselines)
+          (output / "report.txt").write_text("\n".join(report + [""] + failures) + "\n", encoding="utf-8")
+          print((output / "report.txt").read_text())
+          if failures:
+              sys.exit("FAIL: visual verification incomplete or differences detected")
+          print("PASS: all provided screenshots compared within threshold; functional tests and APK build are separate.")
+          PY
+      - name: Upload comparison report and diff images
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pixel-perfect-comparison
+          path: visual-tests/results/
+          if-no-files-found: warn
